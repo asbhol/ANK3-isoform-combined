@@ -1,0 +1,2151 @@
+---
+title: "ANK3 isoform expression"
+author: "Asbjørn"
+date: "8/10/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+library(reshape2)
+library(openxlsx)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(olsrr)
+library(gridExtra)
+library(ggstatsplot)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+## Introduction
+
+This is a document to combine all analysis done for "Mapping the expression of an ANK3 isoform associated with bipolar disorder in the human brain". It was compiled 08-2021. 
+
+## **Child development: ddPCR**
+This experiment uses ddPCR to measure the level of the little exon of ANK3 in the Maryland age-gradient samples (healthy males, %>% 1-24 years old). We also measure the levels of 2 different transcription start sites of the ANK3 transcript. The ddPCR was done in 2 separate experiments, each with GUSB as an endogenous control. The 2 TSS probes were multiplexed. The little exon TaqMan probe, the so-called "M_L" actually covers both the little and middle exon.
+
+```{r import maryland ddPCR, echo=FALSE}
+
+ddPCR_MBC <-
+  readxl::read_xlsx(
+    "/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/data/data_table_original_ddPCR_ANK3_Multiplex_Maryland_091120 AI-2.xlsx", 
+    sheet="data")
+
+#delete unnescessary data
+ddPCR_MBC<-
+  ddPCR_MBC%>% 
+  select(1:3, 5:7, 9)
+
+#get the sample number alone (1-41). 
+
+ddPCR_MBC<-
+  ddPCR_MBC%>% 
+  separate(`Sample description 1`, into=c("description", "Sample_no"), sep="-") 
+
+
+#"description" ends up having an confusing identifier, or the relevant #POS/NTC. Delete the ones we don't want (replace by NA)
+
+ddPCR_MBC$description <-
+  ifelse(ddPCR_MBC$description=="NTC", "NTC",
+       ifelse(ddPCR_MBC$description=="POS", "POS", NA))
+
+#Fix the name of the isoform target. Use "M_L" instead of "Alt-2"
+
+
+  ddPCR_MBC$Target <-
+    str_replace(ddPCR_MBC$Target, "Alt-2", "M_L")  
+
+```
+
+```{r import plate and sample info, echo = FALSE}
+plate <- 
+  readxl::read_xlsx("/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/data/data_table_original_ddPCR_ANK3_Multiplex_Maryland_091120 AI-2.xlsx", 
+    sheet= "sampleID")
+
+age <-  
+  readxl::read_xlsx(
+  "/Users/asbjorh/PhD/ANK3_HTS-amplicons/Maryland/data/Maryland_Samples_NBB1582DonorInfo_cleaned.xlsx", sheet="Sheet1")
+
+
+```
+
+```{r add plate and diagnosis info , echo = FALSE}
+
+
+#combine plate info with sample info
+
+plate_age <- 
+  left_join(plate[,-2], #remove position
+            age,  by="sampleID") 
+
+plate_age$Sample_no <- as.character(plate_age$Sample_no)
+
+
+
+#add sample info to data
+ddPCR_MBC_ID <-
+  left_join(ddPCR_MBC, plate_age, by="Sample_no") %>% 
+  distinct()
+
+#it seems like there have been an misspelling by the lab technician. There is only 2 probes for GUSB, "GUSB" and "GUSB-PL". Change all "GUSB-Pl" into "GUSB-PL"
+
+ddPCR_MBC_ID <-
+  ddPCR_MBC_ID %>% 
+  mutate_if(is.character, 
+                str_replace_all, pattern = "GUSB-Pl", replacement = "GUSB-PL")
+
+```
+
+
+```{r histogram, echo=FALSE, include=FALSE}
+
+ddPCR_MBC_ID %>% 
+  ggplot(mapping=aes(`Copies/20µLWell`)) + 
+  geom_histogram() + 
+  facet_grid(~Target, scales = "free_x") + 
+  theme_bw() +
+  labs(title = "Histograms showing the distribution of measurements for each target")
+```
+
+
+### Raw values by full set and plate
+
+```{r GUSB box plot, echo=FALSE, fig.cap="Boxplots with raw measurements for the GUSB gene"}
+ddPCR_MBC_ID %>% 
+  filter(TargetType=="Reference") %>% 
+  filter(!description %in% c("POS", "NTC")) %>% #filter out the positive and negative controls
+  ggplot(mapping=aes(Target, `Copies/20µLWell`)) +
+  geom_jitter(width=0.2, size=1) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  labs(title="Boxplots with raw measurements for the GUSB gene") 
+```
+
+```{r ANK3 box plot, echo=FALSE, fig.cap="Boxplots with raw measurements for the ANK3 gene"}
+ddPCR_MBC_ID %>% 
+  filter(!grepl("GUSB", ddPCR_MBC_ID$Target)) %>% 
+  ggplot(mapping=aes(Target, `Copies/20µLWell`)) +
+  geom_jitter(width=0.2, size=1) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  labs(title="Boxplots with raw measurements for the ANK3 gene")
+
+
+```
+
+
+### Normalise by using the log2 ratio to GUSB
+
+
+```{r normalise, echo= FALSE}
+##
+#split the data into which GUSB probe was used for normalising in the experiment
+
+
+ddPCR_MBC_ID_GUSB <-
+  ddPCR_MBC_ID %>% 
+  filter(ReferenceUsed=="GUSB"|Target=="GUSB") %>% 
+  select(-TargetType, -`DyeName(s)`, -ReferenceUsed) %>% 
+  pivot_wider( names_from = Target, values_from = `Copies/20µLWell` ) %>% #have one row per sample
+  mutate(`log2_ANK3-4404`=log2(`ANK3-4404`/GUSB), `log2_ANK3-0987`=log2(`ANK3-0987`/GUSB))
+
+
+`ddPCR_MBC_ID_GUSB-PL` <-
+  ddPCR_MBC_ID %>% 
+  filter(ReferenceUsed=="GUSB-PL"|Target=="GUSB-PL") %>% 
+  select(-TargetType, -`DyeName(s)`, -ReferenceUsed) %>% 
+  pivot_wider( names_from = Target, values_from = `Copies/20µLWell` ) %>%  #have one row per sample
+  mutate(`log2_M_L`=log2(`M_L`/`GUSB-PL`))
+
+
+full_set_norm_ddPCR_MBC <-
+`ddPCR_MBC_ID_GUSB-PL` %>% 
+  select(Sample_no, sampleID, `M_L`, `GUSB-PL`, `log2_M_L`) %>% 
+  inner_join(ddPCR_MBC_ID_GUSB, by="sampleID") %>% 
+  select(sampleID, Well, description, RIN, RNAseq, AGEYEARS, gender, PMI, GUSB, `GUSB-PL`, `log2_ANK3-4404`, `log2_ANK3-0987`, `log2_M_L` ) 
+
+#find samples with very low total expression
+low_GUSB_sampleID <-
+  full_set_norm_ddPCR_MBC %>% 
+  filter(GUSB<50|`GUSB-PL`<50) %>%
+  select(sampleID)
+
+#filter out low samples
+full_set_norm_ddPCR_MBC <- 
+  full_set_norm_ddPCR_MBC %>% 
+  filter(!sampleID%in%low_GUSB_sampleID$sampleID)
+
+#make format longer again (one row per observation)
+
+full_set_norm_ddPCR_MBC <-
+  full_set_norm_ddPCR_MBC %>% 
+  pivot_longer(cols = c(11,12,13), 
+               names_to = "Target", 
+               values_to = "log2norm", 
+               names_prefix = "log2_" 
+               ) 
+
+#save this result as tsv for e.g. easy comparison with ANK3-HTS data
+write_tsv(full_set_norm_ddPCR_MBC, file = "/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/ANK3_ddPCR_norm.tsv")
+
+
+```
+
+### QC Is the GUSB measurements with different probes comparable within samples?
+
+```{r GUSB plot, echo=FALSE, fig.cap="Boxplots with raw measurements for the ANK3 gene"}
+ddPCR_MBC_ID_GUSB_all <-
+  ddPCR_MBC_ID_GUSB %>% 
+  select(sampleID, GUSB) %>% 
+  left_join(`ddPCR_MBC_ID_GUSB-PL`, by= "sampleID") %>%  
+  select(sampleID, AGEYEARS, GUSB, `GUSB-PL`) 
+
+ddPCR_MBC_ID_GUSB_all <-
+  filter(ddPCR_MBC_ID_GUSB_all, !is.na(ddPCR_MBC_ID_GUSB_all$sampleID))
+  
+  
+ggscatter(data=ddPCR_MBC_ID_GUSB_all, "GUSB", "GUSB-PL", 
+          add = "reg.line", conf.int = TRUE,
+          cor.coef = TRUE, cor.method = "pearson"
+) +
+labs(title="GUSB values comparing the 2 different probes", 
+       y="GUSB with GUSB-PL VIC probe", 
+       x="GUSB with GUSB FAM probe" )
+
+```
+
+There is excellent correlation between the 2 ddPCR measures of GUSB expression in the same samples.
+```{r plot normalised ANK3, echo= FALSE, message=FALSE, fig.cap="Boxplots with ANK3 log values, normalised for GUSB"}
+full_set_norm_ddPCR_MBC %>% 
+  filter(is.na(full_set_norm_ddPCR_MBC$description)) %>% #take away NTC, POS
+  ggplot(mapping=aes(Target, log2norm)) +
+  geom_jitter(width=0.2, size=1) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  labs(title="Boxplots with ANK3 log values, normalised for GUSB")
+
+```
+
+### Plots of the M_L expression compared to TSS and age
+```{r subsets by TSS, echo= FALSE, message=FALSE}
+#make subset with the 4404 TSS and M_L
+`ANK3-4404` <-
+  full_set_norm_ddPCR_MBC %>% 
+  filter(is.na(full_set_norm_ddPCR_MBC$description)) %>%
+  filter(Target=="M_L" | Target=="ANK3-4404") %>% 
+  select(sampleID, AGEYEARS, Target, log2norm) %>% 
+  pivot_wider(names_from = "Target", values_from = "log2norm") 
+
+#make subset with the 0987 TSS and M_L
+`ANK3-0987` <-
+  full_set_norm_ddPCR_MBC %>% 
+  filter(is.na(full_set_norm_ddPCR_MBC$description)) %>%
+  filter(Target=="M_L" | Target=="ANK3-0987") %>% 
+  select(sampleID, AGEYEARS, Target, log2norm) %>% 
+  pivot_wider(names_from = "Target", values_from = "log2norm") 
+```
+
+```{r plot M_L by TSS1, echo= FALSE, message=FALSE, fig.cap="Expression of the little exon (M_L) as a function of the 4404 TSS1"}
+`ANK3-4404` %>% 
+  ggplot(mapping=aes(x=`ANK3-4404`, y=`M_L`, colour=AGEYEARS))+
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw()
+
+
+```
+
+```{r plot M_L by TSS2, echo= FALSE, message=FALSE, fig.cap="Expression of the little exon (M_L) as a function of the 0987 TSS2"}
+`ANK3-0987` %>% 
+  ggplot(mapping=aes(x=`ANK3-0987`, y=`M_L`, colour=AGEYEARS))+
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw()
+```
+
+```{r plot M_L by age, echo= FALSE, message=FALSE, fig.cap="Expression of the little exon (M_L) as a function of age"}
+
+#plot age and M_L expression
+full_set_norm_ddPCR_MBC %>% 
+  filter(is.na(full_set_norm_ddPCR_MBC$description)) %>% #take away NTC, POS
+  filter(Target=="M_L") %>% 
+  ggplot(mapping=aes(AGEYEARS, log2norm)) +
+    geom_point() +
+  geom_smooth(method = "loess", se=FALSE, formula = y ~ poly(x,2)) + 
+  theme_bw()
+
+```
+
+
+###also plot the TSS with age
+```{r plot 0987 by age, echo= FALSE, message=FALSE}
+
+#plot age and ANK3-0987 expression
+full_set_norm_ddPCR_MBC %>% 
+  filter(is.na(full_set_norm_ddPCR_MBC$description)) %>% #take away NTC, POS
+  filter(Target=="ANK3-0987") %>% 
+  ggplot(mapping=aes(AGEYEARS, log2norm)) +
+    geom_point() +
+  geom_smooth(method = "loess", se=FALSE, formula = y ~ poly(x,2)) +
+                theme_bw() + 
+  labs(title="TSS2 by age")
+
+
+
+#plot age and ANK3-4404 expression
+full_set_norm_ddPCR_MBC %>% 
+  filter(is.na(full_set_norm_ddPCR_MBC$description)) %>% #take away NTC, POS
+  filter(Target=="ANK3-4404") %>% 
+  ggplot(mapping=aes(AGEYEARS, log2norm)) +
+    geom_point() +
+  geom_smooth(method = "loess", se=FALSE, formula = y ~ poly(x,2)) +
+                theme_bw() + 
+  labs(title="TSS1 by age")
+```
+
+
+
+```{r age group, echo= FALSE, message=FALSE, fig.cap="Expression in age group below and above 10 years old" }
+#we are not expecting a linear relationship between age and expression: the brainspan data showed more of a "switching on" in adolescence. Do a simple t-test between those under and above 10 years old.
+
+#add grouping and rename targets
+age_test <-
+  full_set_norm_ddPCR_MBC %>% 
+  filter(!is.na(full_set_norm_ddPCR_MBC$sampleID)) %>% 
+  mutate(age = if_else(AGEYEARS>=10, ">10", "<10")) 
+
+age_test$age <- as.factor(age_test$age)
+
+#rename TSS and isoform for paper
+age_test$Target <- str_replace(age_test$Target, "ANK3-4404", "TSS1")
+age_test$Target <- str_replace(age_test$Target, "ANK3-0987", "TSS2")
+age_test$Target <- str_replace(age_test$Target, "M_L", "M-L")
+
+
+```
+
+```{r ttest age group, echo= FALSE, message=FALSE, fig.cap="t-test of the differences between age groups" }
+
+options(digits=3)
+
+ttest_M_L <-
+  t_test(log2norm ~ age, data= age_test[age_test$Target=="M-L",], detailed = TRUE)
+
+ttest_TSS2 <-
+  t_test(log2norm ~ age, data= age_test[age_test$Target=="TSS2",], detailed = TRUE)
+
+ttest_TSS1 <-
+  t_test(log2norm ~ age, data= age_test[age_test$Target=="TSS1",], detailed = TRUE)
+```
+
+
+```{r box plots with p-values, echo= FALSE, message=FALSE }
+plot_ML<-
+  ggboxplot(age_test[age_test$Target=="M-L",], x = "age", y = "log2norm",   
+          color = "age", palette = "nejm",
+           ggtheme=theme_bw()) + 
+  stat_pvalue_manual(ttest_M_L, hide.ns = TRUE, y.position = 0) +
+  labs(
+    caption = get_test_label(ttest_M_L, detailed = TRUE),
+    title="M-L splice form"
+    ) +
+   theme( plot.title=element_text(size=18,face="bold") 
+         ) +  
+  labs(x = "") 
+
+plot_TSS2 <- 
+  ggboxplot(age_test[age_test$Target=="TSS2",], x = "age", y = "log2norm",   
+          color = "age", palette = "nejm",
+           ggtheme=theme_bw()) + 
+  stat_pvalue_manual(ttest_TSS2, hide.ns = TRUE, y.position = 2.8) +
+  labs(
+    caption = get_test_label(ttest_TSS2, detailed = TRUE),
+    title="TSS2"
+    ) +
+   theme( plot.title=element_text(size=18,face="bold") 
+         ) +  
+  labs(x = "") 
+
+plot_TSS1 <-
+  ggboxplot(age_test[age_test$Target=="TSS1",], x = "age", y = "log2norm",   
+          color = "age", palette = "nejm",
+           ggtheme=theme_bw()) + 
+  stat_pvalue_manual(ttest_TSS1, hide.ns = TRUE, y.position = 4.7) +
+  labs(
+    caption = get_test_label(ttest_TSS1, detailed = TRUE),
+    title="TSS1"
+    ) +
+   theme( plot.title=element_text(size=18,face="bold") 
+         ) +  
+  labs(x = "") 
+
+ggarrange(plot_ML , plot_TSS1, plot_TSS2,
+           ncol =3, nrow = 1,
+          vjust=0.2,
+          hjust=c(-0.2,-0.5,-0.5),
+          common.legend=TRUE, legend = "right",
+          widths =c(3,3,3)
+          ) +
+  xlab("Age group") 
+  
+
+
+p.adjust(c(ttest_M_L$p, ttest_TSS1$p, ttest_TSS2$p), method = "bonferroni")
+```
+Adjusted p-values (Bonferroni) for M-L, TSS1 and TSS2
+
+
+
+## **Case-control: ddPCR**
+The ddPCR measurements of the middle+little isoform of ANK3 (M_L) as well as the 2 TSS have been done on all cDNA samples in the brain biobank (NIH+Stanley). Agata did these experiments in February-April 2021. As before, M_L was measured in duplex with GUSB, and the 2 TSS' were measured in triplex with a different GUSB probe. Since 2 experiments were needed for each sample, the plates were split in half (A/B) and both runs were done simultaneously.
+
+
+```{r import original NIH ddPCR data, echo =FALSE}
+f = list.files("/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/",  pattern= ".xlsx$", full.names  = TRUE)
+
+#remove the plate "MISSING" an%>% "RERUN, needs special treatment to get sample names
+f <- f[-c(1, 14, 15)]
+
+dat = lapply(f, function(i){          #get the data from sheet1
+  x = read.xlsx(i, sheet=1, 
+                colNames = TRUE)
+  # Get the columns you want, e.g. 1, 3, 5
+  x = x[, c(1,2, 3, 6, 8)]
+  # ad%>% a column to say which file they're from
+  x$file = i
+  # Return your data
+  x
+})
+
+
+sampl = lapply(f, function(i){          #get the sample overview from sheet2
+  x = read.xlsx(i, sheet=2, 
+                colNames = TRUE)
+  # Get the columns you want, e.g. 1, 3, 5
+  x = x[, c(1, 2, 3)]
+  # You may want to add a column to say which file they're from
+  x$file = i
+  # Return your data
+  x
+})
+
+
+ddPCR_NIH <-
+  do.call("rbind.data.frame", dat) #make a dataframe out of the imported datasets
+
+sample_overview <- #make a dataframe out of the overview sheets
+  do.call("rbind.data.frame", sampl)
+
+ddPCR_NIH <- 
+  rename(ddPCR_NIH, Plate=file, exp_well=Well) #rename file to plate
+
+ddPCR_NIH$Plate <- #remove unnescessary text from plate names
+  str_remove(ddPCR_NIH$Plate, "/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data//data_table_ANK3_Multiplex_Stanley_plate_")
+
+ddPCR_NIH$Plate <- #remove unnescessary text from plate names
+  str_remove(ddPCR_NIH$Plate, "_AI.xlsx") 
+
+#sometimes there is a print error in the Target name
+ddPCR_NIH$Target <-
+  str_replace(ddPCR_NIH$Target, "GUSB-Pl", "GUSB-PL") #also reference used!!!
+
+ddPCR_NIH$ReferenceUsed <-
+  str_replace(ddPCR_NIH$ReferenceUsed, "GUSB-Pl", "GUSB-PL")
+
+sample_overview <- 
+  rename(sample_overview, Plate=Plate.name) %>% #rename file to plate
+  select(-file)
+#remember the sample well and experiment well. The well in the experiment is sometimes different from the cDNA well. Do not confuse!!! Use the cDNA_ID as identifier as early as possible.
+
+#The identifier is  d:Sample + Plate   , sample_overview: Well+plate
+#match the data table: Sample with cDNA plate: Well,
+
+#match sample name
+ddPCR_NIH<-
+  ddPCR_NIH %>% 
+  left_join(
+    rename(sample_overview, Sample=Well), #rename the well to match column name in ddPCR_NIH
+    by= c("Plate", "Sample" )
+  ) %>% 
+  mutate(newsamplename = 
+           coalesce(newsamplename,Sample)) %>% #put in the value from Sample (NTC/NEG/POS) if newsamplename is NA
+  distinct() %>% 
+  rename(cDNA_ID=newsamplename) %>%
+  select(cDNA_ID, Plate, exp_well, Target, ReferenceUsed, `Copies/20µLWell`) 
+
+#Make new column with only cDNA plate (to later combine with MISSING and re-runs)
+ddPCR_NIH$cDNA.plate <- substr(ddPCR_NIH$Plate, 1, 1)
+
+
+
+
+#add samples from the MISSING plate
+dat = read.xlsx("/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_MISSING_AI.xlsx", sheet=1, 
+                colNames = TRUE)
+  # Get the columns you want, e.g. 1, 3, 5
+  dat = dat[, c(1,2, 3, 6, 8,63)]
+  # You may want to add a column to say which file they're from
+  dat$file = "/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_MISSING_AI.xlsx"
+
+sampl = read.xlsx("/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_MISSING_AI.xlsx", sheet=2, 
+                colNames = TRUE)
+  # Get the columns you want, e.g. 1, 3, 5
+  sampl = sampl[, c(1, 2, 3,5)]
+  # You may want to add a column to say which file they're from
+  sampl$file = "/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_MISSING_AI.xlsx"
+  
+ddPCR_NIH_missing<-
+  dat %>% 
+  rename(cDNA.plate=cDNA.plate.number) %>% 
+  left_join(
+    rename(sampl, Sample=Well), #rename the well to match column name in ddPCR_NIH
+    by= c("cDNA.plate", "Sample" )
+  ) %>% 
+  mutate(newsamplename = 
+           coalesce(newsamplename,Sample)) %>%#put in the value from Sample (NTC/NEG/POS) if newsamplename is NA
+  rename(cDNA_ID=newsamplename, Plate=Plate.name, exp_well=Well) %>% 
+  select(cDNA_ID, cDNA.plate, Plate, exp_well, Target, ReferenceUsed, `Copies/20µLWell`) 
+
+ddPCR_NIH_missing$cDNA.plate <- as.character(ddPCR_NIH_missing$cDNA.plate)   #have to be the same kind as ddPCR_NIH's
+
+#combine original data with re-runs
+
+ddPCR_NIH<-
+  dplyr::bind_rows(ddPCR_NIH, ddPCR_NIH_missing) %>% 
+  select(1,7,2:6) 
+
+
+#add samples from the RERUN plate
+dat = read.xlsx("/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_RERUN_AI.xlsx", sheet=1, 
+                colNames = TRUE)
+  # Get the columns you want, e.g. 1, 3, 5
+  dat = dat[, c(1,2, 3, 6, 8)]
+  # You may want to add a column to say which file they're from
+  dat$file = "/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_RERUN_AI.xlsx"
+
+sampl = read.xlsx("/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_RERUN_AI.xlsx", sheet=2, 
+                colNames = TRUE)
+  # Get the columns you want, e.g. 1, 3, 5
+  sampl = sampl[, c(1, 2, 3,4,5)]
+  # You may want to add a column to say which file they're from
+  sampl$file = "/Users/asbjorh/PhD/ANK3_HTS-amplicons/ddPCR_ANK3_TSS/NIH_ddPCR/data/data_table_ANK3_Multiplex_Stanley_plate_RERUN_AI.xlsx"
+  
+ddPCR_NIH_rerun<-
+  dat %>% 
+  left_join(rename(sampl, Sample=Sample.well.ddPCR.plate, cDNA_well=Well), by= "Sample") %>% 
+  mutate(newsamplename = 
+           coalesce(newsamplename,Sample)) %>%#put in the value from Sample (NTC/NEG/POS) if newsamplename is NA
+  rename(cDNA_ID=newsamplename, Plate=Plate.name, exp_well=Well) %>% 
+  select(cDNA_ID, cDNA.plate, Plate, exp_well, Target, ReferenceUsed, `Copies/20µLWell`) 
+
+ddPCR_NIH_rerun$cDNA.plate <- as.character(ddPCR_NIH_rerun$cDNA.plate)   #have to be the same kind as ddPCR_NIH's
+
+#combine original data with re-runs
+
+ddPCR_NIH<-
+  dplyr::bind_rows(ddPCR_NIH, ddPCR_NIH_rerun) %>% 
+  select(1,7,2:6) 
+
+#remove POS and NEG/NTC samples
+ddPCR_NIH<-
+  ddPCR_NIH %>% 
+  filter(!cDNA_ID %in% c("NEG", "NTC", "POS"))
+
+#Rename the Target. "Alt-2" is instead "ML"
+ddPCR_NIH$Target <- str_replace(ddPCR_NIH$Target, "Alt-2", "ML")
+
+#there are some typos by technician, where ANK3-4404 / ANK3-0987 has become ANK3_4404 / ANK3_0987
+
+ddPCR_NIH$Target <- 
+  str_replace(ddPCR_NIH$Target, "ANK3_4404", "ANK3-4404")
+
+ddPCR_NIH$Target <- 
+str_replace(ddPCR_NIH$Target, "ANK3_0987", "ANK3-0987")  
+
+#remove original samples if they have been rerun
+ddPCR_NIH <-
+  ddPCR_NIH %>% 
+  arrange(desc(ddPCR_NIH$Plate)) %>% #re-arrange, so that RERUN appears first
+  distinct(cDNA_ID, Target, .keep_all = TRUE) #if the combination of cDNA_ID and Target has been seen before, remove rows, while keeping all columns. 
+
+```
+
+
+```{r get in sample names and diagnosis, echo=FALSE, include=FALSE}
+plate <- 
+  readxl::read_xlsx("/Users/asbjorh/PhD/GRIN2A/ddPCR/data/Sample_plate_index.xlsx")
+
+plate <-
+  rename(plate, Well=Brønn)
+
+#import the ID of samples incl RIN etc
+all_info <- 
+  read_tsv("/Users/asbjorh/PhD/GRIN2A/ddPCR/data/sample_RIN_gender_PMI.txt")
+
+
+
+
+```
+
+
+```{r use file for sample info, echo=FALSE}
+plate_diag <-
+  read_tsv("/Users/asbjorh/PhD/ANK3_HTS-amplicons/NIH_plate_diag.tsv")
+
+#change abbreviations for tissue
+
+plate_diag$Tissue <-  
+  str_replace(plate_diag$Tissue, "or", "OFC") 
+
+plate_diag$Tissue <-  
+  str_replace(plate_diag$Tissue, "fro", "FC")
+
+plate_diag$Tissue <-  
+  str_replace(plate_diag$Tissue, "cc", "CC")
+```
+
+
+
+```{r remove unwanted samples, echo=FALSE}
+ddPCR_NIH_diag <- #combine data with info on tissue, diagnosis etc
+  left_join(ddPCR_NIH, 
+            select(plate_diag, -Plate), #remove unneeded information, already have cDNA.plate
+            by= "cDNA_ID")
+
+ddPCR_NIH_diag <-
+  ddPCR_NIH_diag %>% filter(!grepl("Omit", Diagnosis))  #the filter() function normally automatically removes NA- rows. But rephrased like this (with grepl), it removes "Omit", but keep "NA"
+
+#make the diagnosis and probe factor (categorical data)
+
+ddPCR_NIH_diag$Diagnosis <- as.factor(ddPCR_NIH_diag$Diagnosis)
+ddPCR_NIH_diag$Target <- as.factor(ddPCR_NIH_diag$Target)
+#change order of the categories in the diagnosis factor, to change the default plotting order
+ddPCR_NIH_diag$Diagnosis <- factor(ddPCR_NIH_diag$Diagnosis, c("C", "BD", "SCZ"))
+ 
+
+
+low_RIN <- 
+  all_info %>% 
+  filter(RIN<5) %>% 
+  select(cDNA_ID, RIN) #get cDNA_ID of samples with too low RIN
+
+ddPCR_NIH_diag <- 
+  ddPCR_NIH_diag %>% 
+  filter(!cDNA_ID %in% low_RIN$cDNA_ID) #use this to exclude low RIN samples (n=10) 
+
+
+#Remove samples that are not from people (used for standards in HTS-experiment)
+ddPCR_NIH_diag <-
+  ddPCR_NIH_diag %>% 
+  filter(collection %in% c("Stanley", "NIH"))
+
+
+
+```
+
+Some samples were in need of a rerun, for 2 different reasons. For one, some samples needed to be removed to give way to necessary positive and negative controls. These were added in a separate experiment after the 6 initial plates were run, and coined "MISSING". Then, a few samples from most plates were of poor quality (missing values or too low GUSB), and in need of a re-run. We know from the GRIN2A experiment that there is not anything wrong with the RNA of these samples.
+
+
+```{r find samples to rerun, eval=FALSE, echo=FALSE }
+#do not include
+#get overview of no-calls/ low call samples. Did this to plan wich samples should be rerun.
+rerun <-
+  ddPCR_NIH_diag %>% 
+  filter(is.na(ddPCR_NIH_diag$`Copies/20µLWell`), !cDNA_ID %in% c("NEG", "NTC", "POS")) %>% 
+  filter() %>% 
+  select(cDNA_ID, cDNA.plate,  Plate, Well, exp_well) %>% 
+  distinct()
+
+ rerun2 <- 
+   ddPCR_NIH_diag %>%   
+   filter(Target%in% c("GUSB", "GUSB-PL"), `Copies/20µLWell`<100 ) %>% 
+   select(cDNA_ID, cDNA.plate,  Plate, Well, exp_well) %>% 
+  distinct()
+
+ rerun <- dplyr::add_row(rerun, rerun2) %>% 
+   select(1:2,4,3,5) %>% rename(exp_plate=Plate)
+ 
+ rerun %>% 
+   select(cDNA_ID, exp_plate) %>% 
+   distinct() %>% 
+   count( exp_plate)
+ 
+ #make a table with how many samples per plate effected by quality issues.
+ #rerun %>% 
+  # select(cDNA_ID, exp_plate) %>% 
+  # distinct() %>% 
+  # count( exp_plate) %>% 
+  # kable(caption="number of cDNA samples needed to rerun per plate", "simple")
+ 
+#export to .tsv
+ write_tsv(rerun, "rerun_samples_updated.txt")
+ 
+
+```
+
+
+```{r show age, echo =FALSE}
+all_info  %>% 
+  select(cDNA_ID, Age, Diagnosis) %>% 
+  filter(Diagnosis!="Omit") %>% 
+  distinct() %>% 
+  ggplot(mapping= aes(x=Diagnosis, y=Age)) +  
+  geom_boxplot() + 
+  facet_wrap( ~ Diagnosis, scales="free_x") + 
+  theme_bw() +
+  labs(title="Age distribution of samples, for each diagnosis category")
+
+all_info  %>% 
+  select(cDNA_ID, Age, Diagnosis) %>% 
+  filter(Diagnosis!="Omit") %>% #one ID that the biobank asks to omit
+  distinct() %>%
+  group_by(Diagnosis) %>% 
+  get_summary_stats(Age, type= "mean_sd")
+
+```
+
+```{r sample overview, eval=FALSE, include=FALSE}
+
+#count samples in categories
+counts <- all_info %>% 
+  filter(Diagnosis!="Omit") %>% 
+  select( -RIN, -PMI, -subject) %>% 
+  group_by(source, tissue, Diagnosis) %>% 
+  summarise(n=n())
+
+#get mean age
+mean_age <- 
+  all_info %>% 
+  filter(Diagnosis!="Omit") %>% 
+  select( -RIN, -PMI, -subject) %>% 
+  group_by(source, tissue) %>% 
+  summarise(n=n(), mean=mean(Age))
+
+#get proportion of gender
+all_info %>% filter(Diagnosis!="Omit") %>% select( -RIN, -PMI, -subject) %>% group_by(source, tissue, Sex) %>% summarise(n=n()) %>% mutate(freq= n/sum(n))
+
+```
+
+## Raw values by plate
+
+Recall that samples are not randomly distributed between plates, some plates are entirely or mostly corpus callosum, that we expect to have higher expression of the M_L isoform. 
+
+Each sample have been measured for GUSB twice, with a different probe set. The scatter plot confirms that the two measurements are very similar, and thus quite reliable.
+
+
+```{r raw values import, echo=FALSE}
+
+ddPCR_NIH_diag %>% 
+  ggplot(mapping=aes(`Copies/20µLWell`)) + 
+  geom_histogram(binwidth=500) + 
+  facet_grid(~Target, scales = "free_x") + 
+  theme_bw() +
+  labs(title = "Histograms showing the distribution of measurements for each gene")
+
+
+ddPCR_NIH_diag %>% 
+  ggplot(mapping=aes(cDNA.plate, `Copies/20µLWell`)) +
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Plate)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(~Target, scales = "free_x")+
+  labs(title="Boxplots with measurements for all Targets") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  #tilt x-axis labels
+
+
+#plot GUSB probes against each other as a diagnostic
+
+ddPCR_NIH_diag_GUSB <-
+  ddPCR_NIH_diag %>% 
+  filter(Target %in% c("GUSB", "GUSB-PL")) %>% 
+  select(cDNA_ID, Plate, Target, `Copies/20µLWell`, cDNA.plate) %>% 
+  pivot_wider(names_from = Target, values_from = `Copies/20µLWell`  ) 
+
+
+  
+ggscatter(data=ddPCR_NIH_diag_GUSB, "GUSB", "GUSB-PL", 
+          add = "reg.line", conf.int = TRUE,
+          cor.coef = TRUE, cor.method = "pearson"
+) +
+labs(title="GUSB values comparing the 2 different probes", 
+       y="GUSB with GUSB-PL VIC probe", 
+       x="GUSB with GUSB FAM probe" )
+
+
+```
+
+
+## Normalise by using the log2 ratio to GUSB
+
+
+```{r normalise NIH, echo= FALSE}
+##
+#split the data into which GUSB probe was used for normalising in the experiment
+
+ddPCR_NIH_GUSB_norm <-
+  ddPCR_NIH_diag %>% 
+  filter(ReferenceUsed=="GUSB"|Target=="GUSB") %>% 
+  select(-exp_well, -ReferenceUsed, `Copies/20µLWell`) %>%  #move values to last
+  pivot_wider( names_from = Target, values_from = `Copies/20µLWell` ) %>%  #have one row per sample
+  mutate(`log2_ANK3-4404_norm`=log2(`ANK3-4404`/GUSB), `log2_ANK3-0987_norm`=log2(`ANK3-0987`/GUSB)) 
+
+`ddPCR_NIH_GUSB-PL_norm` <-
+  ddPCR_NIH_diag %>% 
+  filter(ReferenceUsed=="GUSB-PL"|Target=="GUSB-PL") %>% 
+  select(-exp_well, -ReferenceUsed, `Copies/20µLWell`) %>%  #move values to last
+  pivot_wider( names_from = Target, values_from = `Copies/20µLWell` ) %>%  #have one row per sample
+  mutate(`log2_ML_norm`=log2(ML/`GUSB-PL`)) 
+
+full_set_norm_ddPCR_NIH <-
+`ddPCR_NIH_GUSB-PL_norm` %>%   
+  filter(!is.na(`ddPCR_NIH_GUSB-PL_norm`$cDNA.plate))%>%
+  select(cDNA_ID, `ML`, `GUSB-PL`, `log2_ML_norm`) %>% 
+  inner_join(ddPCR_NIH_GUSB_norm, by="cDNA_ID") %>% 
+  select(cDNA_ID, Plate, cDNA.plate, Well, Tissue, collection, Repository,Diagnosis, GUSB, `GUSB-PL`, `ANK3-4404`,`ANK3-0987`, ML, `log2_ANK3-4404_norm`, `log2_ANK3-0987_norm`, `log2_ML_norm` )
+
+#make format longer again (one row per observation)
+
+full_set_norm_ddPCR_NIH <-
+  full_set_norm_ddPCR_NIH %>% 
+  pivot_longer(cols = c(14,15,16), 
+               names_to = "Target", 
+               values_to = "log2norm", 
+               names_prefix = "log2_" 
+               ) %>% 
+  select(-GUSB, -`GUSB-PL`, -`ANK3-4404`, -`ANK3-0987`, -`ML`)
+
+```
+
+Here the measurements have been log2-transformed and normalised to the GUSB-measurement in the multiplex experiment. 
+
+```{r plot normalised ANK3 NIH, echo= FALSE}
+
+full_set_norm_ddPCR_NIH %>% 
+  ggplot(mapping=aes(Target, log2norm)) +
+  geom_jitter(width=0.2, size=1) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle = 90, vjust = 0.5)) +
+  labs(title="Boxplots with ANK3 log values by cDNA plate, normalised for GUSB") +
+  facet_grid(~cDNA.plate, scales = "free_x")
+
+
+full_set_norm_ddPCR_NIH %>% 
+  ggplot(mapping=aes(Diagnosis, log2norm)) + 
+  geom_violin() + 
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Diagnosis)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(Target ~ Tissue, scales = "free") +
+  labs(title="ddPCR of M_L and TSS, normalised to GUSB for all tissues") +
+  scale_color_brewer(palette = "Dark2")
+```
+
+
+## Multiple linear regression
+In order to have reasonably normally distributed values, I have separated into corpus callosum and cortical (frontal + orbitofrontal) tissue. Test for normal distribution, and fit a model with known characteristics. Then, update the model with the significant coefficients.  
+
+```{r regression, echo= FALSE, fig.show='hide'}
+
+#get more info into data
+ddPCR_NIH_norm_info <- left_join(full_set_norm_ddPCR_NIH, select(all_info, -c(3:4, 9)), by= "cDNA_ID")
+
+#make subsets based on tissue (cc/(cortical=fro+or))
+ddPCR_NIH_norm_info$Tissue <- as.factor(ddPCR_NIH_norm_info$Tissue)
+
+ddPCR_NIH_norm_info_ML_cc <- filter(ddPCR_NIH_norm_info, Target=="ML_norm", Tissue =="CC")
+ddPCR_NIH_norm_info_ML_cortical <- filter(ddPCR_NIH_norm_info, Target=="ML_norm", Tissue %in% c("OFC", "FC"), !is.na(ddPCR_NIH_norm_info$log2norm))
+
+
+#fit model with possible coefficients
+model_ML_cc <- lm(log2norm ~ Diagnosis  + RIN + PMI + Age + Sex, ddPCR_NIH_norm_info_ML_cc )
+model_ML_cortical <- lm(log2norm ~ Diagnosis  +  PMI + Age + Sex, ddPCR_NIH_norm_info_ML_cortical ) #RIN is not known for Stanley
+
+#test for normality etc
+#make plots 
+qq_cc <- ols_plot_resid_qq(model_ML_cc) + theme_bw()
+fit_cc <- ols_plot_resid_fit(model_ML_cc) + theme_bw()
+hist_cc <- ols_plot_resid_hist(model_ML_cc) + theme_bw()
+
+#test for normality etc
+#make plots 
+qq_cortical <- ols_plot_resid_qq(model_ML_cortical) + theme_bw()
+fit_cortical <- ols_plot_resid_fit(model_ML_cortical) + theme_bw()
+hist_cortical <- ols_plot_resid_hist(model_ML_cortical) + theme_bw()
+
+
+
+
+
+
+```
+
+Multiple linear regression of the M_L isoform for corpus callosum samples:
+cc can be modeled with age and RIN
+
+```{r regression plots cc, echo= FALSE}
+#plot plots
+grid.arrange(qq_cc, fit_cc, hist_cc, ncol=3)
+summary(model_ML_cc)
+
+#summary: cc can be modeled with age and RIN
+model_ML_cc_update <- 
+  lm(log2norm ~  RIN + Age , ddPCR_NIH_norm_info_ML_cc )
+
+summary(model_ML_cc_update)
+```
+
+
+```{r plot ML cc by time, echo= FALSE}
+
+ddPCR_NIH_norm_info_ML_cc  %>% 
+  filter(Target=="ML_norm") %>% 
+  ggplot(mapping=aes(Age, log2norm)) +
+    geom_point() +
+  geom_smooth(method = "loess", se=TRUE, formula = y ~ poly(x,1)) + 
+  theme_bw() +  
+  stat_regline_equation(label.y =0) + #intercept and slope. Uses ggpubr.
+  stat_cor(label.y = -0.5, aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~"))) + #add R2 and p-value for the regression line
+  labs(title = "M-L expression in the case-control set with respect to age")
+
+```
+
+
+Multiple linear regression of the M_L isoform for cortical samples:
+cortical samples can be modeled with age (We don't have RIN values for most Stanley samples)
+
+```{r regression plots cortical, echo= FALSE}
+#plot plots
+
+grid.arrange(qq_cortical, fit_cortical, hist_cortical, ncol=3)
+summary(model_ML_cortical)
+
+#summary: cortical can be modeled with age 
+model_ML_cortical_update <- 
+  lm(log2norm ~   Age , ddPCR_NIH_norm_info_ML_cortical )
+
+summary(model_ML_cortical_update)
+```
+
+##Statistical testing
+The sample set is slightly complex, in that it contains 3 different health states (C/BD/SCZ) and 3 different tissues (cc/fro/or). Here, for each ddPCR target, we run a 1-way ANOVA comparing the different tissues. 
+
+```{r 1-way anova for tissue (each target), echo= FALSE}
+#change the order of Tissue for plotting
+
+full_set_norm_ddPCR_NIH <-
+full_set_norm_ddPCR_NIH %>% 
+  mutate(Tissue = factor(Tissue, levels = c("CC", "FC", "OFC"))) 
+
+
+#table of all mean values by tissue
+log2norm_table<-  #make a table with grouped values
+  ddPCR_NIH_norm_info %>%
+  group_by( Target, Tissue) %>%
+  get_summary_stats(log2norm, type= "mean_sd") %>% 
+  select(-variable)
+
+kbl(select(log2norm_table, -Target), caption="Mean values of ddPCR, log2-normalised to GUSB, by tissue") %>%  #design the table, adding group names.
+  kable_paper("striped", full_width = F) %>%
+  pack_rows("TSS2", 1, 3) %>%
+  pack_rows("TSS1", 4, 6) %>%
+  pack_rows("ML", 7, 9)
+
+#should p-values from test be included in this table?
+
+###M_L differences between tissues
+ddPCR_NIH_norm_info_ML <-
+  ddPCR_NIH_norm_info %>% 
+  filter(Target=="ML_norm")
+
+ddPCR_NIH_norm_info_ML %>% 
+    group_by( Tissue) %>% 
+  get_summary_stats(log2norm, type= "mean_sd")
+
+
+res.aov_ML <- ddPCR_NIH_norm_info_ML %>%  
+  anova_test(log2norm ~  Tissue)
+
+pwc_ML <- ddPCR_NIH_norm_info_ML %>% #post-hoc test to see what are significantly different
+  tukey_hsd(log2norm ~ Tissue)
+
+# Visualization: box plots with p-values
+pwc_ML <- pwc_ML %>% add_xy_position(x = "Tissue")
+
+plot_ML <-
+ggboxplot(ddPCR_NIH_norm_info_ML, x = "Tissue", y = "log2norm",   
+          color = "Tissue", palette = "nejm",
+            outlier.shape = NA,
+           ggtheme=theme_bw()) +
+  stat_pvalue_manual(pwc_ML, hide.ns = TRUE) +
+  labs(
+    caption = get_test_label(res.aov_ML, detailed = TRUE),
+    title="M-L splice form"
+    #caption = get_pwc_label(pwc_ML)
+    ) +
+     theme( plot.title=element_text(size=18,face="bold") 
+         ) #+
+  #labs(title="1-way ANOVA of the M_L isoform (GUSB-normalised) between tissues")
+
+
+### ANK3-0987_norm differences between tissues
+    full_set_norm_ddPCR_NIH %>% 
+      filter(Target=="ANK3-0987_norm") %>% 
+      group_by( Tissue) %>% 
+  get_summary_stats(log2norm, type= "mean_sd")
+
+
+res.aov_0987 <-    full_set_norm_ddPCR_NIH %>% 
+      filter(Target=="ANK3-0987_norm") %>%  
+  anova_test(log2norm ~  Tissue)
+
+
+ pwc_0987 <-
+   full_set_norm_ddPCR_NIH %>% 
+      filter(Target=="ANK3-0987_norm") %>% #post-hoc test to see what are significantly different
+  tukey_hsd(log2norm ~ Tissue)
+
+
+
+# Visualization: box plots with p-values
+pwc_0987 <- pwc_0987 %>% add_xy_position(x = "Tissue")  
+
+
+
+
+#there is a problem here in that the order is changed, so significance asterix are shown between CC-FC. I suspect it is the same problem for all plots, but the others are all the same anyway.
+plot_TSS2 <-
+ggboxplot(
+  filter(full_set_norm_ddPCR_NIH, Target=="ANK3-0987_norm"), 
+  x = "Tissue", y = "log2norm",
+            color = "Tissue", palette = "nejm",
+    outlier.shape = NA,
+   ggtheme=theme_bw()) +
+  stat_pvalue_manual(pwc_0987, hide.ns = TRUE) +
+  labs(
+    caption = get_test_label(res.aov_0987, detailed = TRUE),
+    title= "TSS2"
+    #caption = get_pwc_label(pwc_0987)
+    )+
+     theme( plot.title=element_text(size=18,face="bold") 
+         )# +
+  #labs(title= (GUSB-normalised) between tissues")
+
+###ANK3-4404_norm differences between tissues
+    full_set_norm_ddPCR_NIH %>% 
+      filter(Target=="ANK3-4404_norm") %>% 
+      group_by( Tissue) %>% 
+  get_summary_stats(log2norm, type= "mean_sd")
+
+
+res.aov_4404 <-    full_set_norm_ddPCR_NIH %>% 
+      filter(Target=="ANK3-4404_norm") %>%  
+  anova_test(log2norm ~  Tissue)
+
+ pwc_4404 <-
+   full_set_norm_ddPCR_NIH %>% 
+      filter(Target=="ANK3-4404_norm") %>% #post-hoc test to see what are significantly different
+  tukey_hsd(log2norm ~ Tissue)
+
+# Visualization: box plots with p-values
+pwc_4404 <- pwc_4404 %>% add_xy_position(x = "Tissue")
+
+plot_TSS1<-
+ggboxplot(
+  filter(full_set_norm_ddPCR_NIH, Target=="ANK3-4404_norm"), 
+  x = "Tissue", y = "log2norm", 
+            color = "Tissue", palette = "nejm",
+  outlier.shape = NA,
+  ggtheme=theme_bw()) +
+  stat_pvalue_manual(pwc_4404, hide.ns = TRUE) +
+  labs(
+    caption = get_test_label(res.aov_4404, detailed = TRUE),
+    title= "TSS1"
+    #caption = get_pwc_label(pwc_4404) +
+    ) +
+     theme( plot.title=element_text(size=18,face="bold") 
+         ) #+
+  #labs(title="1-way ANOVA of the 4404 TSS (GUSB-normalised) between tissues")
+
+
+ggarrange(plot_ML , plot_TSS1, plot_TSS2,
+           #labels = c("M-L splice form", "TSS1", "TSS2"),
+           ncol =3, nrow = 1,
+          vjust=0.2,
+          hjust=c(-0.2,-0.5,-0.5),
+          common.legend=TRUE, legend = "right") 
+
+
+ # labs(title= "Expression of M-L splice form and TSS1 and TSS2, quantified with ddPCR"))
+
+```
+
+
+Statistical testing of the M_L isoform in corpus callosum tissue between diagnosis. 
+
+```{r 1-way anova ML cc, echo= TRUE}
+ddPCR_NIH_norm_info_ML_cc %>% levene_test(log2norm ~ Diagnosis) #are the variances homogenous? Yes
+ddPCR_NIH_norm_info_ML_cc %>% anova_test(log2norm ~ Diagnosis) #Are there any significant differences? NO
+ddPCR_NIH_norm_info_ML_cc %>% tukey_hsd(log2norm ~ Diagnosis) #If yes, which groups are different?
+
+```
+
+```{r 1-way anova all, echo= FALSE}
+options(digits = 3)
+
+anova_TSS1_FC <-
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>% 
+  filter(Tissue=="FC", Target=="ANK3-4404_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis) 
+
+anova_TSS1_OFC <- 
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="OFC", Target=="ANK3-4404_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis) 
+
+anova_TSS1_CC <- 
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="CC", Target=="ANK3-4404_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis)
+
+anova_TSS2_FC <-
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="FC", Target=="ANK3-0987_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis) 
+
+anova_TSS2_OFC <- 
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="OFC", Target=="ANK3-0987_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis) 
+
+anova_TSS2_CC <- 
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="CC", Target=="ANK3-0987_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis)
+
+anova_ML_FC <-
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="FC", Target=="ML_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis) 
+
+anova_ML_OFC <- 
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="OFC", Target=="ML_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis) 
+
+anova_ML_CC <- 
+  ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="CC", Target=="ML_norm") %>% 
+  anova_test(`log2norm` ~ Diagnosis)
+
+
+ anova_all <-
+  do.call(rbind, list(
+    anova_TSS1_FC=anova_TSS1_FC, 
+    anova_TSS1_OFC=anova_TSS1_OFC, 
+    anova_TSS1_CC=anova_TSS1_CC,
+    anova_TSS2_FC=anova_TSS2_FC, 
+    anova_TSS2_OFC=anova_TSS2_OFC, 
+    anova_TSS2_CC=anova_TSS2_CC,
+    anova_ML_FC=anova_ML_FC, 
+    anova_ML_OFC=anova_ML_OFC, 
+    anova_ML_CC=anova_ML_CC
+    ))
+  
+ddPCR_NIH_norm_info %>% 
+  drop_na(log2norm) %>%
+  filter(Tissue=="OFC", Target=="ANK3-0987_norm") %>%
+  tukey_hsd(`log2norm` ~ Diagnosis) #If yes, which groups are different? Control and SCZ
+ 
+ 
+anova_all$p.adj <- p.adjust(anova_all[,5], method="bonferroni")
+
+
+kbl(anova_all) %>% kable_classic()
+
+
+```
+
+
+
+
+
+
+
+## **Case-control (NIH) HTS counts of amplicons**
+
+```{r setup2, include=FALSE, echo=FALSE}
+library(RColorBrewer)
+```
+
+
+```{r import, echo=FALSE, include=FALSE}
+
+counts <- read_delim("/Users/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/analysis/Full_set/run_script/exon_counts_full.tsv", 
+                     col_names= FALSE, 
+                     delim = "\t" 
+)
+
+#have all observations for a sample on the same row
+counts_spread <- counts %>%
+  select(-X3) %>% spread(X4,X5) %>% select(-"exon:no")
+
+
+#extract info from columns
+HTS_NIH <- counts_spread %>% 
+  separate(col = "X1", sep = "-", into = c("set", "pool")) %>% 
+  separate("X2", sep = "-", into = c("NSCsample", "barcode")) %>% 
+  mutate(barcode = as.numeric(str_replace(barcode, "R", ""))) %>% 
+  select(-set, -NSCsample)
+
+#rename isoforms. Not completely ideal, since R doesn't allow names to begin with numbers. OK if back-quoted (remember to be consistent about this throughout)
+
+HTS_NIH <- HTS_NIH %>% rename(`0_0`="Alt0", `0_L`="Little", "M_0"="Middle", "M_L"="Middle-Little") 
+
+
+#go back to having only one observation per row
+HTS_NIH <- reshape2::melt(HTS_NIH, id.vars=c("pool","barcode"))
+HTS_NIH <- HTS_NIH %>% rename("isoform"="variable")
+
+HTS_NIH$value <- as.numeric(HTS_NIH$value)
+HTS_NIH$barcode <- as.numeric(HTS_NIH$barcode)
+
+
+```
+
+
+```{r import plate info, echo=FALSE }
+
+plate <- readxl::read_xlsx("/Users/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/analysis/Sample_plate_index.xlsx")
+
+#change abbreviations for tissue
+plate$Tissue <-  
+  str_replace(plate$Tissue, "or", "OFC") 
+
+plate$Tissue <-  
+  str_replace(plate$Tissue, "fro", "FC")
+
+plate$Tissue <-  
+  str_replace(plate$Tissue, "cc", "CC")
+  
+
+plate <- plate %>% mutate(pool = toupper(pool))
+
+plate$barcode <- as.numeric(plate$barcode)
+
+#import the ID of samples incl RIN etc
+all_info <- 
+  read_tsv("/Users/asbjorh/PhD/GRIN2A/ddPCR/data/sample_RIN_gender_PMI.txt")
+
+
+diag <-  
+  select(all_info, c(1,4))
+
+
+#NSC's pooling volumes for flow cell loading
+pooling <- readxl::read_xls("/Users/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/data/92-1631112_pools_NSCpooling.xls")        
+pooling <- pooling %>% select(Sample,`Sample Molarity`, `Sample Volume`) %>% 
+  mutate(Sample = str_replace(Sample, "AH-ANK3-pool-", "")) %>%
+  separate(Sample, sep = "-", into = c("MM_ID", "pool"))
+
+
+HTS_NIH$barcode <- as.numeric(HTS_NIH$barcode)
+plate$barcode <- as.numeric(plate$barcode)
+
+
+```
+
+
+```{r filter and clean, echo=FALSE}
+
+#find the samples with very low GUSB (n=4)
+pool_barcode_low_GUSB <- 
+  HTS_NIH %>% filter(isoform %in% "GUSB") %>% 
+  filter(value < 100) %>% #this is after plotting to see outlayers. Could be generalised to say mean-3sd or something 
+  select(c(pool, barcode))
+
+#remove the samples with very low GUSB
+HTS_NIH <- anti_join(HTS_NIH, pool_barcode_low_GUSB)
+
+#rename column to match each other
+names(plate)[names(plate) == 'Brønn'] <- 'Well'
+
+
+#add info on sample, tissue, collection etc
+HTS_NIH_sample <- HTS_NIH %>% 
+  left_join(plate, by= c("pool", "barcode")) %>% 
+  select(-c("MM_ID", "MM_Plate")) 
+
+
+
+```
+
+
+
+
+```{r colour scheme, echo=FALSE }
+#create custom manual colour scale (colourblind-friendly) to make isoform colour consistent (uses RColorBrewer)
+myColours <- brewer.pal(5,"Dark2")
+names(myColours) <- levels(HTS_NIH$isoform)
+colScale <- 
+  scale_color_manual(  #ggplot subcommand
+    name ="isoform", values = myColours, drop= TRUE, limits = levels(HTS_NIH$isoform)) 
+```
+
+
+
+```{r add plate and diagnosis info NIH HTS, echo = FALSE}
+#add diag info  
+HTS_NIH_diag <-
+  left_join(HTS_NIH_sample, diag, by="cDNA_ID") 
+
+#HTS_NIH_diag <- left_join(HTS_NIH_diag, select(all_info, -c(3:4, 9)), by= "cDNA_ID") #add more info (RIN, age etc)
+
+#samples that should be omitted (1 individual from Stanley AC, i.e 3 samples)
+HTS_NIH_diag <-
+  HTS_NIH_diag %>% filter(!grepl("Omit", Diagnosis))  #the filter() function normally automatically removes NA- rows. But rephrased like this, it removes "Omit", but keep "NA"
+
+#make the diagnosis field catagorical (factor), to ease plotting (easier to order) 
+HTS_NIH_diag$Diagnosis <- (as.factor(HTS_NIH_diag$Diagnosis))
+
+```
+
+
+Plot the raw values before any normalisation. Notice the striking tissue-specific pattern. This is entirely as expected, that the frontal tissues have mostly expression of the "neuronal" isoform without middle/little exon.
+
+
+```{r plot not normalised, echo=FALSE }
+
+#plot all samples
+HTS_NIH_diag %>% 
+  filter(Tissue !="std") %>% 
+  ggplot(aes(x=cDNA_ID, y=value, col=isoform, group=isoform)) + 
+  geom_line() + 
+  facet_wrap(vars(Tissue), scales = "free_x") + 
+  labs(title="plot all isoforms by tissue. Not normalised.") +
+  colScale
+
+#plot standards
+HTS_NIH_sample %>% 
+  filter(Tissue =="std") %>% 
+  ggplot(aes(x=cDNA_ID, y=value, col=isoform, group=isoform)) + 
+  geom_line() +
+  scale_x_discrete(limits = c("275-2k", "347-2k", "338-6k", "316-10k", "336-10k")) +
+  theme_bw() +
+   labs(title="plot all standards. Not normalised.") +
+  colScale
+
+```
+
+
+
+```{r standards, echo=FALSE}
+#convert the standards to numbers, and prepare measurements for normalisation
+#get values for standards
+standard_values <-
+  HTS_NIH_sample %>% 
+  filter(Tissue =="std")
+#split column to get input levels in a column
+standard_values <-
+  standard_values %>%  
+  separate(cDNA_ID, c("sample", "template"), sep = "-") 
+
+#transform into numerics (not e.g. 2k)
+standard_values$template <- 
+  as.numeric(sub("k", "e3", standard_values$template, fixed = TRUE))
+
+#get readcount per pool
+fragments <- 
+  readxl::read_xls(
+    "/Users/asbjorh/PhD/ANK3_HTS-amplicons/results_prep/92-1631112_pools_NSCpooling.xls", 
+    sheet = "fragments")
+
+#add total reads in pool
+standard_values <- 
+  left_join(standard_values, fragments, by= "pool")
+
+```
+
+## Normalisation
+It is possible that some samples with very high total ANK3 expression would have more reads in total. Nevertheless, before sequencing, we have tried to make sure that all pools are as equal as possible. We measured concentration and delivered with the same mass. NSC looked at average molecular size, and calculated equimolar amounts to go on the flow cell. Even so, not all pools have the same number of reads. This is probably mostly due to stochastic effects on the flow cell. We therefore normalise all counts with the total amount of reads for that pool. 
+
+In order to be able to compare expression levels between splice forms (isoforms), we multiply each ANK3 measurement with the relative ratio for that PCR product as calculated with the synthetic oligo standards. Use the maryland sample set standards, since that range of template input behaved more consistently.
+
+The most important per-sample normalisation for ANK3 isoforms is with the GUSB endogenous control. GUSB is always in the same pool, so all measures for the same samples are normalised by the same factor. When it comes to the measured values for GUSB itself, they can be offset by the total product in the sample (GUSB + ANK3) used for normalising both in the lab and bioinformatically. So perhaps one should not expect a perfect correlation with other methods (i.e. ddPCR), as I initially thought.
+
+Normalisation:
+
+$$norm = \log_2(\frac{value}{poolreads}*meanreads)$$.
+
+```{r normalise and log-tr, echo=FALSE }
+#normalise all values with total reads from the pool.
+#get readcount per pool
+fragments <- 
+  readxl::read_xls(
+    "/Users/asbjorh/PhD/ANK3_HTS-amplicons/results_prep/92-1631112_pools_NSCpooling.xls", 
+    sheet = "fragments")
+
+#get mean readcount. To keep sensible numbers, have the normalisation factor be "mean pool reads"/"pool reads"
+
+frag_mean <- mean(fragments$fragments)
+
+#insert pool reads into 
+
+HTS_NIH_norm <- 
+  HTS_NIH_diag %>% 
+  left_join(fragments, by="pool") %>% 
+  mutate("lin_readnorm"=value/fragments*frag_mean) 
+
+
+
+
+##adjust each isoform after standard result
+#import standard values
+maryland_ratios <- readxl::read_xlsx("/Users/asbjorh/PhD/ANK3_HTS-amplicons/Maryland/standard_ratios.xlsx", sheet = "ratios")
+maryland_ratios <- maryland_ratios[,c(1,4)] #keep the ratio itself only
+
+#add column for isoform factor
+
+HTS_NIH_norm$isoform_factor <- as.numeric("")
+
+#populate with the corresponding factor in maryland list
+HTS_NIH_norm <- 
+  HTS_NIH_norm %>% 
+  mutate("isoform_factor" = case_when(isoform=="0_0"  ~ as.numeric(maryland_ratios[maryland_ratios$isoform=="0_0",2]),
+                                      isoform=="0_L"  ~ as.numeric(maryland_ratios[maryland_ratios$isoform=="0_L",2]),
+                                      isoform=="M_0"  ~ as.numeric(maryland_ratios[maryland_ratios$isoform=="M_0",2]),
+                                      isoform=="M_L"  ~ as.numeric(maryland_ratios[maryland_ratios$isoform=="M_L",2]),
+                                      TRUE ~ 1))  #keeps GUSB as is
+
+#adjust read counts with isoform-specific ratio, in effect reducing those that have shorter amplicon lengths than the longest (M_L)
+HTS_NIH_norm <-
+  HTS_NIH_norm %>% 
+  mutate(std_norm= lin_readnorm/isoform_factor) %>%
+  mutate(log2readnorm= log2(std_norm)) 
+
+
+
+#Normalise for GUSB in each sample by subtracting the log2value of GUSB from each isoform count
+HTS_NIH_norm <-
+  HTS_NIH_norm %>% 
+  select(1:3,5:11,16) %>% 
+  pivot_wider(names_from = isoform, #all isoforms on same row
+              values_from= log2readnorm ) %>%  
+  pivot_longer(cols= c(10,12:14), #keep GUSB, but send the rest of the values to unique lines
+               names_to="isoform", 
+               values_to="log2readnorm") %>% 
+  mutate("log2readnorm-GUSB"= log2readnorm-GUSB) %>% 
+  select(1:9,11,12,10,13) #reorder columns
+
+#change order of the categories in the diagnosis factor, to change the default plotting order
+HTS_NIH_norm$Diagnosis <- factor(HTS_NIH_norm$Diagnosis, c("C", "BD", "SCZ"))
+ 
+HTS_NIH_norm$isoform <- as.factor(HTS_NIH_norm$isoform)
+
+
+HTS_NIH_norm <- 
+  HTS_NIH_norm %>% 
+  filter(!cDNA_ID %in% low_RIN$cDNA_ID) #use this to exclude low RIN samples (n=10) 
+
+#take out GUSB readnorm values in separate df
+GUSB_readnorm <- 
+  HTS_NIH_norm %>% 
+  select(1:9,12) %>% 
+  rename("GUSB_readnorm_log2"=GUSB) %>% 
+  distinct() %>% 
+  mutate("GUSB_readnorm"=2^GUSB_readnorm_log2)
+
+
+
+#export results for easy access later on
+#write_tsv(
+ # HTS_NIH_norm, 
+#  "../Full_set/ANK3_HTS_normalised_exported.txt"
+#  )
+```
+
+
+
+##QC
+### Barcodes
+The plots shows the count of the start point of the different barcodes.
+
+Our demultiplexing looks for the barcode after 4N, allowing for 1 error. Thus sequences with <3 N will be dropped.
+
+Seems like this is not a big problem at all (up to 1 % of reads), and no particular barcodes are extreme outlayers.
+
+```{r QC barcode placement, echo=FALSE }
+#Does the barcode have 4N in front of it?
+
+#plot colummns of where barcode was found (5=4N in front)
+#these places were found with an awk index script
+N_place <- 
+  read.delim("/Users/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/analysis/N/results_index_place_all.tsv", 
+                      header = FALSE)
+
+#bash script at /Users/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/analysis/N/barcode_index.sh 
+N_place  %>%  
+  ggplot(aes(x=V2, y=V1)) + 
+  geom_col() +
+  facet_wrap(vars(V3))+ 
+  theme_bw() + 
+  coord_cartesian(xlim=c(1,6)) +
+  labs(title = "Placement of the barcode within read, i.e. x-1 N-bases in front of barcode")
+  
+
+N_place  %>%  
+  ggplot(aes(x=V2, y=V1)) + 
+  geom_col() +
+  facet_wrap(vars(V3))+ 
+  theme_bw() + 
+  coord_cartesian(xlim=c(1,6), ylim=c(0,20000)) +
+  labs(title = "Placement of the barcode within read, i.e. x-1 N-bases in front of barcode (zoomed in)")
+  
+
+
+
+
+```
+
+### Demultiplexing
+Bars show number of reads per pool. 
+The analysis have been
+trim adapter sequence -> demultiplex -> find sequence in isoform -> double-check sequence
+
+Light grey on top is reads gone between trimmed -> demultiplex, i.e. Reads without barcode
+Zoom in on one example to show this in detail
+
+```{r QC reads included, echo=FALSE, message=FALSE}
+
+
+
+reads <- read.table("/Users/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/analysis/Full_set/run_script/reads_all_fastq.tsv", header = FALSE)
+colnames(reads) <-  c("reads", "file")
+
+ 
+#to categorise the files:
+#Analysis pathway: trim adapters -> demultiplex with cutadapt -> 
+#search for sequences with cutadapt -> double-check presence of sequences with grep
+#nested ifelse statements (next ifelse is "no", where "yes" is true in a pattern search)
+reads$kind <-
+  ifelse(grepl("MiSeq", reads$file), "full",
+         ifelse(grepl("trimmed", reads$file), "trimmed", 
+                ifelse(grepl("check", reads$file), "grep-checked", 
+                       ifelse(grepl("seq-present.fastq", reads$file), "sequence", 
+                              "demux"))))
+
+#make column with pool value, based on filename
+reads <- 
+  reads %>% 
+  mutate("newfile"=file) %>%   
+  separate(newfile, into = c("pre", "post"), sep = "pool-") %>%  
+  separate(post, into = c("pool", "post"), sep = "_") %>%  
+  select(-pre, -post)
+
+#make column with barcode (where relevant)
+reads$barcode <- 
+  substring(reads$file, 
+            regexpr("-all-", reads$file) + 
+              5) #removes the first 5 characters ("-all-")
+
+reads <- 
+  reads %>% 
+  separate(barcode, 
+           into = c("barcode", "post"), 
+           sep = "[.]", 
+           extra="merge") %>% 
+  select( -post) 
+
+reads$barcode <- na_if(reads$barcode, 
+                       "mmed")
+reads$barcode <- na_if(reads$barcode, 
+                       "ers/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/data/200722_M02980")
+
+
+#include info on R1 vs R2
+reads$read <-
+  ifelse(grepl("trimmed.R1", reads$file), "R1",
+         ifelse(grepl("trimmed.R2", reads$file), "R2", 
+                ifelse(grepl("R1.fastq.gz", reads$file), "R1", 
+                       ifelse(grepl("R2.fastq.gz", reads$file), "R2",
+                              ifelse(grepl("R1_001.fastq.gz", reads$file), "R1", 
+                                     ifelse(grepl("R2_001.fastq.gz", reads$file), "R2",
+                                            NA))))))
+
+
+#make sum vectors for each kind
+#Otherwise it is hard to sort out the R1/R2 correctly
+
+x1 <-reads %>% filter(kind=="grep-checked") %>% 
+  group_by(pool)%>% 
+  summarise(sum=sum(reads)) %>% 
+  mutate(kind="grep-checked")
+
+x2 <-reads %>% filter(kind=="sequence") %>% 
+  group_by(pool)%>% 
+  summarise(sum=sum(reads)) %>% 
+  mutate(kind="sequence")
+
+x3 <- reads %>% filter(kind=="demux", read=="R1") %>% 
+  group_by(pool)%>% 
+  summarise(sum=sum(reads)) %>% 
+  mutate(kind="demux")
+
+x4 <- reads %>% filter(kind=="full", read=="R1") %>% 
+  group_by(pool)%>% 
+  summarise(sum=sum(reads)) %>% 
+  mutate(kind="full")
+
+x5 <- reads %>% filter(kind=="trimmed", read=="R1") %>% 
+  group_by(pool)%>% 
+  summarise(sum=sum(reads)) %>% 
+  mutate(kind="trimmed")
+
+#combine all read sums
+read_sum <- rbind(x1, x2, x3, x4, x5)
+
+
+#reorder the sum data, so that stacks are in chronological order. Make them into categorical data first (factor)
+read_sum$kind = 
+  factor(read_sum$kind, levels=c("full" ,"trimmed", "demux", "sequence","grep-checked"))
+
+ggplot(read_sum, 
+       aes(x=pool, y=sum, colour=kind)) + 
+  geom_bar(stat="identity", position="identity", alpha=.3) + 
+  #geom_text(aes(label=kind), position=position_dodge(width=0.9), vjust=-0.25)+
+ # scale_colour_grey() +
+  theme_bw() 
+
+  require("ggrepel")
+  
+read_sum %>% 
+  filter(pool=="A1") %>% 
+  ggplot(aes(x=pool, y=sum, colour=kind)) + 
+  geom_bar(stat="identity", position="identity", alpha=.3, width = 0.1) + 
+theme_bw() +
+geom_text_repel(
+#  data = read_sum,
+  aes(label = kind),
+  size = 5,
+  box.padding = unit(1.5, "lines"),
+  point.padding = unit(0.3, "lines")
+)
+
+
+
+```
+
+
+### Expression of the endogenous control GUSB per sample and pool
+
+Counts of GUSB (endogenous control), from different barcodes, ordered by NSC-prepped pool.
+
+It shows relatively even counts, without any pools as obvious outlayers (overall GUSB mean highlighted)
+
+
+```{r QC, echo=FALSE, message=FALSE  }
+  GUSB_readnorm %>% 
+  ggplot(aes(x=barcode, y=GUSB_readnorm)) + 
+  geom_line(col="#D95F02") + 
+  facet_wrap(vars(pool), scales = "free_x") +
+  coord_cartesian(ylim=c(0,2000)) +
+  geom_hline(yintercept =  mean(GUSB_readnorm$GUSB_readnorm), col="#a9a9a9")
+```
+
+
+### Expression of the ANK3 isoforms, before normalisation
+Here we plot the read-normalised values for each isoform. 
+a) ALt0 and middle isoforms by tissue type
+b) isoforms incorporating the little isoforms by tissue type
+
+As expected, middle exon is more prominent in corpus callosum, whereas the "0-0" variant (aka "neuronal" isoform") is by far the most expressed in frontal tissue. 
+As expected, middle-little exon is more prominent in corpus callosum
+
+Recall: These are not normalised to GUSB
+
+```{r isoforms by tissue, echo=FALSE}
+#plot Alt0, Middle by tissue 
+HTS_NIH_sample %>% 
+  filter(isoform %in% c("0_0", "M_0"), Tissue !="std") %>% 
+  ggplot(aes(x=cDNA_ID, y=value, colour=isoform, group=isoform)) + 
+  geom_line() + 
+  facet_wrap(vars(Tissue), scales = "free_x") + 
+  scale_colour_manual(values= myColours, 
+        limits = levels(c("0_0", "M_0"))) +
+  labs(title = "a)")
+
+
+#plot Middle-Little, Little by tissue 
+HTS_NIH_sample %>% 
+  filter(isoform %in% c("M_L", "0_L"), Tissue !="std") %>% 
+  ggplot(aes(x=cDNA_ID, y=value, col=isoform, group=isoform)) + 
+  geom_line() + 
+  facet_wrap(vars(Tissue), scales = "free_x") + 
+  scale_colour_manual(values= myColours, 
+        limits = levels(c("M_L", "0_L"))) +
+  labs(title = "b)")  
+
+```
+
+Here we plot the read-normalised values of all isoforms. They have been normalised by GUSB for each sample, and also for amplicon efficiency. 
+
+```{r isoforms by diagnosis, echo=FALSE}
+
+#Plot the M_0 normalised to GUSB for all tissues 
+
+HTS_NIH_norm %>% 
+  filter(Tissue!="std" ) %>%
+  filter(isoform=="M_0") %>%  
+  ggplot(mapping=aes(Diagnosis, `log2readnorm-GUSB`)) + 
+  geom_violin() + 
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Diagnosis)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(vars(Tissue), 
+             #vars(collection), 
+             scales = "free_y") +
+  labs(title="M_0 normalised to GUSB for all tissues") +
+  scale_color_brewer(palette = "Dark2")
+
+#Plot the M_L normalised to GUSB for all tissues 
+
+HTS_NIH_norm %>% 
+  filter(Tissue!="std" ) %>%
+  filter(isoform=="M_L") %>%  
+  ggplot(mapping=aes(Diagnosis, `log2readnorm-GUSB`)) + 
+  geom_violin() + 
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Diagnosis)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(vars(Tissue), 
+             #vars(collection), 
+             scales = "free_y") +
+  labs(title="M_L normalised to GUSB for all tissues") +
+  scale_color_brewer(palette = "Dark2")
+
+#Plot the 0_L normalised to GUSB for all tissues 
+HTS_NIH_norm %>% 
+  filter(Tissue!="std" ) %>%
+  filter(isoform=="0_L") %>%  
+  ggplot(mapping=aes(Diagnosis, `log2readnorm-GUSB`)) + 
+  geom_violin() + 
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Diagnosis)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(vars(Tissue), 
+             #vars(collection), 
+             scales = "free_y") +
+  labs(title="0_L normalised to GUSB for all tissues") +
+  scale_color_brewer(palette = "Dark2")
+
+
+#Plot the 0_0 normalised to GUSB for all tissues 
+HTS_NIH_norm %>% 
+  filter(Tissue!="std" ) %>%
+  filter(isoform=="0_0") %>%  
+  ggplot(mapping=aes(Diagnosis, `log2readnorm-GUSB`)) + 
+  geom_violin() + 
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Diagnosis)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(vars(Tissue), 
+             #vars(collection), 
+             scales = "free_y") +
+  labs(title="0_0 normalised to GUSB for all tissues") +
+  scale_color_brewer(palette = "Dark2")
+
+```
+
+
+```{r series of t-test CC vs FC, echo=FALSE}
+
+tissue_test_noOFC <-
+  HTS_NIH_norm %>% 
+  filter(!Tissue%in% c("std", "OFC"))
+
+
+
+tissue_test_noOFC %>% 
+  ggplot(aes(Tissue, `log2readnorm-GUSB`, group=Tissue)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(title = "Expression in tissue type") +
+  xlab("tissue") +
+  ylab( "expression, log2-normalised") +
+  facet_wrap("isoform", scales = "free_y" ) 
+
+
+options(digits=3)
+
+ `ttest_M-L` <-
+  t.test(`log2readnorm-GUSB` ~ Tissue, data= tissue_test_noOFC[tissue_test_noOFC$isoform=="M_L",])
+
+ `ttest_0-0` <-
+  t.test(`log2readnorm-GUSB` ~ Tissue, data= tissue_test_noOFC[tissue_test_noOFC$isoform=="0_0",])
+
+ `ttest_M-0` <-
+  t.test(`log2readnorm-GUSB` ~ Tissue, data= tissue_test_noOFC[tissue_test_noOFC$isoform=="M_0",])
+
+ `ttest_0-L` <-
+  t.test(`log2readnorm-GUSB` ~ Tissue, data= tissue_test_noOFC[tissue_test_noOFC$isoform=="0_L",])
+  
+ ttest_noOFC_all <-
+  cbind( `ttest_0-0`,  `ttest_M-0`,  `ttest_M-L`
+        #, ttest_noOFC_0L 
+        )
+
+ ttest_noOFC_all_p <-  ttest_noOFC_all[3,]
+ ttest_noOFC_all_p.bonf <-p.adjust( ttest_noOFC_all_p, method="bonferroni") # use bonferroni-adjustment since n is so low
+
+ ttest_noOFC_all_est <-  ttest_noOFC_all[c(3,5),, drop=FALSE]
+ ttest_noOFC_all_est <- rbind( ttest_noOFC_all_est,  ttest_noOFC_all_p.bonf)
+
+rownames( ttest_noOFC_all_est) <- c("p.value", "group_means", "p.adj")
+ ttest_noOFC_all_est <-  ttest_noOFC_all_est[c(2,1,3),] #change order of rows
+
+
+
+kbl(
+  as.data.frame(ttest_noOFC_all_est, drop=FALSE), #to get the values out of the matrix
+  caption= "2-sided t-test of the differences in mean between CC and FC", 
+  "simple") %>% 
+  kable_paper("striped", full_width = F)
+
+
+```
+
+
+
+```{r one-way ANOVA for diagnosis in tissues, echo=FALSE}
+anova_00_FC <-
+  HTS_NIH_norm %>% 
+  filter(Tissue=="FC", isoform=="0_0") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis) 
+
+
+anova_00_OFC <- 
+  HTS_NIH_norm %>% 
+  filter(Tissue=="OFC", isoform=="0_0") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis) 
+
+anova_00_CC <- 
+  HTS_NIH_norm %>% 
+  filter(Tissue=="CC", isoform=="0_0") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis)
+
+anova_M0_FC <-
+  HTS_NIH_norm %>% 
+  filter(Tissue=="FC", isoform=="M_0") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis) 
+
+
+anova_M0_OFC <- 
+  HTS_NIH_norm %>% 
+  filter(Tissue=="OFC", isoform=="M_0") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis) 
+
+anova_M0_CC <- 
+  HTS_NIH_norm %>% 
+  filter(Tissue=="CC", isoform=="M_0") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis)
+
+anova_ML_FC <-
+  HTS_NIH_norm %>% 
+  filter(Tissue=="FC", isoform=="M_L") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis) 
+
+
+anova_ML_OFC <- 
+  HTS_NIH_norm %>% 
+  filter(Tissue=="OFC", isoform=="M_L") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis) 
+
+anova_ML_CC <- 
+  HTS_NIH_norm %>% 
+  filter(Tissue=="CC", isoform=="M_L") %>% 
+  anova_test(`log2readnorm-GUSB` ~ Diagnosis)
+
+
+
+
+  HTS_NIH_norm %>% 
+  filter(Tissue=="CC", isoform=="M_0") %>%  tukey_hsd(`log2readnorm-GUSB` ~ Diagnosis) #If yes, which groups are different? Controls and BD.
+
+
+```
+
+
+```{r collect all one-way ANOVA for diagnosis, echo=FALSE}
+
+ anova_all <-
+  do.call(rbind, list(
+    anova_00_FC=anova_00_FC, 
+    anova_00_OFC=anova_00_OFC, 
+    anova_00_CC=anova_00_CC,
+    anova_M0_FC=anova_M0_FC, 
+    anova_M0_OFC=anova_M0_OFC, 
+    anova_M0_CC=anova_M0_CC,
+    anova_ML_FC=anova_ML_FC, 
+    anova_ML_OFC=anova_ML_OFC, 
+    anova_ML_CC=anova_ML_CC
+    ))
+  
+  
+
+anova_all$p.adj <- p.adjust(anova_all[,5], method="bonferroni")
+
+anova_all
+
+```
+
+There is a nominal p< 0.05 for the difference between controls and BD in the M_0 isoform, but this does not hold up after considering multiple testing.
+
+```{r make figure for paper: all isoforms all tissues, echo=FALSE}
+
+#this figure shows more, but it may not display the difference between tissues as well as if tissues are faceted in columns
+HTS_NIH_norm %>% 
+  filter(Tissue!="std" ) %>%
+  #filter(isoform!="0_L") %>%  #filter away the 0_L if needed
+  ggplot(mapping=aes(Diagnosis, `log2readnorm-GUSB`)) + 
+  geom_violin() + 
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Diagnosis)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(cols= vars(factor(isoform, levels=c('0_0','M_0','M_L','0_L'))), rows=vars( Tissue),
+             #vars(collection), 
+             scales = "free_y") +
+  labs(title="Splice forms, normalised to GUSB, for all tissues" ) +
+  ylab("Read counts, normalised to GUSB (log2)") +
+  scale_color_brewer(palette = "Dark2")
+
+
+HTS_NIH_norm %>% 
+  filter(Tissue!="std" ) %>%
+  filter(isoform=="0_0") %>%  
+  ggplot(mapping=aes(Diagnosis, `log2readnorm-GUSB`)) + 
+  geom_violin() + 
+  geom_jitter(width=0.2, size=1, mapping=aes(colour=Diagnosis)) + 
+  geom_boxplot(fill=NA, width= 0.1, outlier.shape = NA) + 
+  theme_bw() + 
+  facet_grid(vars(Tissue), 
+             #vars(collection), 
+             scales = "free_y") +
+  labs(title="0_0 normalised to GUSB for all tissues") +
+  scale_color_brewer(palette = "Dark2")
+
+```
+
+```{r making tissue boxplot for paper, echo=FALSE}
+
+#```{r 1-way anova for tissue (each target), echo= FALSE}
+#table of all mean values by tissue
+log2norm_table<-  #make a table with grouped values
+  HTS_NIH_norm %>%
+  filter(!isoform=="0_L") %>% 
+  filter(!Tissue=="std") %>% 
+  group_by( isoform, Tissue) %>%
+  get_summary_stats(`log2readnorm-GUSB`, type= "mean_sd")
+
+kbl(select(log2norm_table, -variable), caption="Mean values of HTS, log2-normalised to GUSB, by tissue") %>%  #design the table, adding group names.
+  kable_paper("striped", full_width = F) %>%
+  pack_rows("0-0", 1, 3) %>%
+  pack_rows("M-0", 4, 6) %>%
+  pack_rows("M-L", 7, 9)
+
+#should p-values from test be included in this table?
+
+###0_0 differences between tissues
+HTS_NIH_norm_info_00 <-
+  HTS_NIH_norm %>% 
+  filter(!Tissue=="std") %>% 
+  filter(isoform=="0_0") %>% 
+  rename(log2readnorm_GUSB=`log2readnorm-GUSB`)
+
+
+HTS_NIH_norm_info_00 %>% 
+    group_by( Tissue) %>% 
+  get_summary_stats(log2readnorm_GUSB, type= "mean_sd")
+
+
+res.aov_00 <- HTS_NIH_norm_info_00 %>%  
+  anova_test(log2readnorm_GUSB ~  Tissue)
+
+pwc_00 <- HTS_NIH_norm_info_00 %>% #post-hoc test to see what are significantly different
+  tukey_hsd(log2readnorm_GUSB ~ Tissue)
+
+# Visualization: box plots with p-values
+pwc_00 <- pwc_00 %>% add_xy_position(x = "Tissue")
+
+
+plot_00 <-
+ggboxplot(HTS_NIH_norm_info_00, x = "Tissue", y = "log2readnorm_GUSB",   
+          color = "Tissue", palette = "nejm",
+           ggtheme=theme_bw()) +
+  stat_pvalue_manual(pwc_00, hide.ns = TRUE) +
+  labs(
+    caption = get_test_label(res.aov_00, detailed = TRUE),
+    title="0-0 splice form") +
+   theme( plot.title=element_text(size=20,face="bold") 
+         )
+###M_0 differences between tissues
+HTS_NIH_norm_info_M0 <-
+  HTS_NIH_norm %>% 
+  filter(!Tissue=="std") %>% 
+  filter(isoform=="M_0") %>% 
+  rename(log2readnorm_GUSB=`log2readnorm-GUSB`)
+
+
+HTS_NIH_norm_info_M0 %>% 
+    group_by( Tissue) %>% 
+  get_summary_stats(log2readnorm_GUSB, type= "mean_sd")
+
+
+res.aov_M0 <- HTS_NIH_norm_info_M0 %>%  
+  anova_test(log2readnorm_GUSB ~  Tissue)
+
+pwc_M0 <- HTS_NIH_norm_info_M0 %>% #post-hoc test to see what are significantly different
+  tukey_hsd(log2readnorm_GUSB ~ Tissue)
+
+# Visualization: box plots with p-values
+pwc_M0 <- pwc_M0 %>% add_xy_position(x = "Tissue")
+
+
+plot_M0 <-
+ggboxplot(HTS_NIH_norm_info_M0, x = "Tissue", y = "log2readnorm_GUSB",   
+          color = "Tissue", palette = "nejm",
+           ggtheme=theme_bw()) +
+  stat_pvalue_manual(pwc_M0, hide.ns = TRUE) +
+  labs(
+    caption = get_test_label(res.aov_M0, detailed = TRUE),
+    title="M-0 splice form") +
+   theme( plot.title=element_text(size=20,face="bold") 
+         )
+
+###M_L differences between tissues
+HTS_NIH_norm_info_ML <-
+  HTS_NIH_norm %>% 
+  filter(!Tissue=="std") %>% 
+  filter(isoform=="M_L") %>% 
+  rename(log2readnorm_GUSB=`log2readnorm-GUSB`)
+
+
+HTS_NIH_norm_info_ML %>% 
+    group_by( Tissue) %>% 
+  get_summary_stats(log2readnorm_GUSB, type= "mean_sd")
+
+
+res.aov_ML <- HTS_NIH_norm_info_ML %>%  
+  anova_test(log2readnorm_GUSB ~  Tissue)
+
+pwc_ML <- HTS_NIH_norm_info_ML %>% #post-hoc test to see what are significantly different
+  tukey_hsd(log2readnorm_GUSB ~ Tissue)
+
+# Visualization: box plots with p-values
+pwc_ML <- pwc_ML %>% add_xy_position(x = "Tissue")
+
+
+plot_ML <-
+ggboxplot(HTS_NIH_norm_info_ML, x = "Tissue", y = "log2readnorm_GUSB",   
+          color = "Tissue", palette = "nejm",
+           ggtheme=theme_bw()) +
+  stat_pvalue_manual(pwc_ML, hide.ns = TRUE) +
+  labs(
+    caption = get_test_label(res.aov_ML, detailed = TRUE),
+    title="M-L splice form"
+    #caption = get_pwc_label(pwc_ML)
+    ) +
+   theme( plot.title=element_text(size=20,face="bold") 
+         )
+
+
+ggarrange(plot_00 , plot_M0, plot_ML,
+           ncol =3, nrow = 1,
+          vjust=0.2,
+          hjust=c(-0.2,-0.5,-0.5),
+          common.legend=TRUE, legend = "right",
+          widths =c(3,3,3)
+          )
+
+
+ # labs(title= "Expression of M-L splice form and TSS1 and TSS2, quantified with ddPCR"))
+
+```
+
+
+
+
+
+##comparison ddPCR vs HTS
+
+
+```{r ddPCR vs HTS-ANK3, echo= FALSE}
+##make a comparison of the M_L results from ddPCR and HTS. Facet by tissue.
+
+#import HTS-results
+HTS_norm <- 
+  read_tsv("/Users/asbjorh/PhD/ANK3_HTS-amplicons/MiSeq/analysis/Full_set/ANK3_HTS_normalised_exported.txt")
+
+#remove standards
+standards_ID <- c("347-2k","338-6k", "336-10k", "316-10k", "275-2k") 
+HTS_norm <-
+  HTS_norm %>% 
+  filter(!cDNA_ID %in% standards_ID) 
+
+
+#combine HTS into ddPCR ML results
+ML_ddPCR_HTS <-
+  HTS_norm %>% 
+  filter(isoform=="M_L") %>% 
+  select(cDNA_ID, `log2readnorm-GUSB`) %>% 
+  rename(HTS_ML=`log2readnorm-GUSB`) %>% 
+  right_join(filter(full_set_norm, Target=="ML_norm"), by="cDNA_ID") 
+  
+
+ggscatter(data=ML_ddPCR_HTS, "HTS_ML", "log2norm", 
+          add = "reg.line", conf.int = TRUE,
+          cor.coef = TRUE, cor.method = "pearson"
+) +
+labs(title="M-L splice form comparing HTS measurements and ddPCR ", 
+       y="ML isoform (ddPCR), GUSB normalised", 
+       x="ML isoform (HTS), GUSB normalised" )
+
+ML_ddPCR_HTS %>% drop_na(HTS_ML, log2norm) %>%   summarise(n=n())
+
+#combine HTS into ddPCR GUSB results
+GUSB_ddPCR_HTS <-
+  HTS_norm %>% 
+  select(cDNA_ID, GUSB) %>%
+  distinct() %>% 
+  mutate(HTS_GUSB=2^GUSB) %>% 
+  select(-GUSB) %>% 
+  left_join(select(ddPCR_NIH_diag_GUSB, cDNA_ID, 'GUSB-PL'), by="cDNA_ID") %>% 
+  rename(GUSB_ddPCR='GUSB-PL')
+  
+
+ggscatter(data=GUSB_ddPCR_HTS, "HTS_GUSB", "GUSB_ddPCR", 
+          add = "reg.line", conf.int = TRUE,
+          cor.coef = TRUE, cor.method = "pearson"
+) +
+labs(title="GUSB comparing HTS measurements and ddPCR ", 
+       y="GUSB (ddPCR copies per 20 ul)", 
+       x="GUSB (HTS reads)" )
+
+GUSB_ddPCR_HTS %>% drop_na(HTS_GUSB, GUSB_ddPCR) %>%   summarise(n=n())
+
+```
+
+## **Child development: HTS**
